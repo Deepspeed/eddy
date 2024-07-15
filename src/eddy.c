@@ -23,27 +23,30 @@
 //  gcc -o eddy eddy.c `pkg-config --cflags --libs eina efl elementary eeze`
 
 #include "eddy.h"
-# include <Eeze_Disk.h>
+#include <Eeze_Disk.h>
 
 /* specific log domain to help debug only eddy */
 int _eddy_log_dom = -1;
 
-
-
 /* function for child process to finish md5 check and show results properly */
 static Eina_Bool
-md5_msg_handler(void *data, int t EINA_UNUSED, void *event)
+md5_msg_handler(void *data, int t, void *event)
 {
 	EINA_SAFETY_ON_NULL_RETURN_VAL(event, ECORE_CALLBACK_DONE);
 	EINA_SAFETY_ON_NULL_RETURN_VAL(data, ECORE_CALLBACK_DONE);
 
-	Eddy_GUI * inst = data;
-	Ecore_Exe_Event_Data *dataFromProcess = (Ecore_Exe_Event_Data *) event;
-	int i, j = 0;
-	char msg[BUFFER_SIZE] = {0}, result[PATH_MAX];
-	char str[] = "<align=left>Md5sum checked: ";
+	Eddy_GUI *inst = data;
+	if (t == ECORE_EXE_EVENT_ERROR) {
+		// FIXME: Why is this output tripled after first time?
+		ERR("md5sum encountered an error.\n");
+		elm_progressbar_pulse(inst->busy, EINA_FALSE);
+		return ECORE_CALLBACK_DONE;
+	}
 
-	if (dataFromProcess->size >= (BUFFER_SIZE - 1)){
+	Ecore_Exe_Event_Data *dataFromProcess = (Ecore_Exe_Event_Data *) event;
+	char msg[BUFFER_SIZE] = {0}, result[BUFFER_SIZE] = "<align=left>Md5sum checked: ";
+
+	if (dataFromProcess->size >= (BUFFER_SIZE - strlen(result) - 1)){
 		printf("Data too big for bugger. error\n");
 		return ECORE_CALLBACK_DONE;
 	}
@@ -53,23 +56,33 @@ md5_msg_handler(void *data, int t EINA_UNUSED, void *event)
 
 	if (debug) INF("%s\n", msg);
 
-	i = strlen(msg);
-	while(msg[i] != ':')//iterate backwards to :
-		i--;
+	size_t colon_pos = strrchr(msg, ':') - msg;
+	// Check if a colon was found
+	if (colon_pos == (size_t)-1) {
+		INF("md5sum message format unexpected (missing colon)\n");
+		elm_progressbar_pulse(inst->busy, EINA_FALSE);
+		return ECORE_CALLBACK_DONE;
+	}
 
-	for(i += 2; msg[i] != '\0'; i++, j++)//store result separately
-		result[j] = msg[i];
+	// Calculate existing length of the result string
+	size_t existing_len = strlen(result);
+	char *result_msg = msg + colon_pos + 2;
+	size_t result_size = strlen(result_msg); // +2 to skip ':' and space
 
-	strcat(str, result);//format text for label
+	// Check for overflow before appending
+	if (existing_len + result_size + 1 > BUFFER_SIZE) {
+	  // Handle overflow (e.g., truncate or log error)
+	  return ECORE_CALLBACK_DONE;
+	}
 
-	elm_object_text_set(inst->md5, str);//show test results
+	// Extract the desired portion of the message after the colon
+	strncat(result, result_msg, result_size);
+	result[existing_len + result_size] = '\0'; // Ensure null termination
 
+	elm_object_text_set(inst->md5, result); //show test results
 	elm_progressbar_pulse(inst->busy, EINA_FALSE);
 	return ECORE_CALLBACK_DONE;
 }
-
-
-
 
 /* return file extension of a file path */
 static const char *
@@ -78,13 +91,14 @@ file_get_ext(const char *file)
 	EINA_SAFETY_ON_NULL_RETURN_VAL(file, NULL);
 
 	char *base = ecore_file_strip_ext(file);
+
 	int i = strlen(base) + 1;
+	if (strlen(file) == (i - 1))
+		return NULL; // No file extension.
+
 	free(base);
 	return file + i*sizeof(char);
 }
-
-
-
 
 /* get the ISO selected and set it to a visible entry*/
 static void
@@ -104,7 +118,8 @@ iso_chosen(void *data, Evas_Object *obj, void *event_info)
 		elm_object_text_set(inst->md5, "");
 
 	//filetype filter
-	if(strcmp(file_get_ext(file), "iso")){
+	const char *ext = file_get_ext(file);
+	if(ext == NULL || strcmp(ext, "iso") != 0){
 		printf("Wrong file type!  Try again.\n");
 		elm_object_text_set(inst->iso,"<align=left>Please choose .iso file");
 		return;
@@ -113,32 +128,18 @@ iso_chosen(void *data, Evas_Object *obj, void *event_info)
 	elm_object_text_set(inst->iso, buf);
 }
 
-
-
-
 /* Check selected md5 file against ISO.  ISO must be in same folder. */
 static void
 md5_check(void *data, Evas_Object *o EINA_UNUSED, void *e)
 {
 	EINA_SAFETY_ON_NULL_RETURN(data);
+
 	Eddy_GUI *inst = data;
-
-	//ecore_exe stuff
-	pid_t childPid;
-	Ecore_Exe *childHandle;
-
-	//filepaths
-	char *isoPath = NULL;
-	char md5Path[PATH_MAX+8];
-	char *folderPath = NULL;
-	char command[PATH_MAX+26];//terminal command
+	inst->md5Command = NULL; // Reset md5Command
+	inst->md5Path = NULL; // Reset md5Path
 
 	const char *tmpPath = elm_object_text_get(inst->iso);
 	if (debug) INF("ISO path %s", tmpPath);
-
-	/* remove extra <align=left> bit */
-	isoPath = elm_entry_markup_to_utf8(tmpPath);
-
 	if(!strcmp(tmpPath, "<br>")){
 		printf("No .iso file chosen yet!\n");
 		elm_object_text_set(inst->md5, "<align=left>No .iso file chosen yet!");
@@ -148,18 +149,45 @@ md5_check(void *data, Evas_Object *o EINA_UNUSED, void *e)
 	elm_progressbar_pulse(inst->busy, EINA_TRUE);
 	elm_object_text_set(inst->md5, "<align=left>Checking ISO md5sum");
 
+
+	//ecore_exe stuff
+	pid_t childPid;
+	Ecore_Exe *childHandle;
+
+	//filepaths
+	char *isoPath = NULL;
+	char *folderPath = NULL;
+
+	/* remove extra <align=left> bit */
+	isoPath = elm_entry_markup_to_utf8(tmpPath);
+	inst->md5Path = malloc(strlen(isoPath) + 4 + 1); // .md5 +1 for null terminator
+	if (!inst->md5Path) {
+		// Handle memory allocation failure
+		return;
+	}
+
+	strcpy(inst->md5Path, isoPath);
+	strcat(inst->md5Path, ".md5");
+
 	/* set folderPath directory */
 	folderPath = ecore_file_dir_get(isoPath);
 
+	const char *format_string = "cd \"%s\" && md5sum -c \"%s\"";
+	size_t commandLen = strlen(format_string) + strlen(folderPath) + strlen(inst->md5Path) + 3; // +3 for null terminators
+	inst->md5Command = malloc(commandLen);
+	if (!inst->md5Command) {
+		// Handle memory allocation failure
+		return;
+	}
+
 	//build terminal command
-	snprintf(md5Path, PATH_MAX+7,  "%s.md5", isoPath);
-	snprintf(command,PATH_MAX+29,"cd \"%s\" && md5sum -c \"%s\"",folderPath, md5Path);
-	if (debug) INF("MD5 PATH %s", md5Path);
+	snprintf(inst->md5Command, commandLen, "cd \"%s\" && md5sum -c \"%s\"", folderPath, inst->md5Path);
+	if (debug) INF("MD5 PATH %s", inst->md5Path);
 	free(isoPath);
 	free(folderPath);
 
 	//check for md5 file existence
-	if(!ecore_file_exists(md5Path)){
+	if(!ecore_file_exists(inst->md5Path)){
 		printf("md5 file does not exist in this folder!\n");
 		elm_object_text_set(inst->md5, "<align=left>.md5 file not found!");
 		elm_progressbar_pulse(inst->busy, EINA_FALSE);
@@ -167,18 +195,18 @@ md5_check(void *data, Evas_Object *o EINA_UNUSED, void *e)
 	}
 
 	//readability check
-	if(!ecore_file_can_read(md5Path)){
+	if(!ecore_file_can_read(inst->md5Path)){
 		printf("md5 file cannot be read!\n");
 		elm_object_text_set(inst->md5,"<align=left>.md5 file unreadable!");
 		elm_progressbar_pulse(inst->busy, EINA_FALSE);
 		return;
 	}
-  if (debug) INF("COMMAND %s", command);
-	/* execute md5 check. */
-	childHandle = ecore_exe_pipe_run(command,
-					ECORE_EXE_PIPE_WRITE |
+
+	if (debug) INF("COMMAND %s", inst->md5Command);
+	childHandle = ecore_exe_pipe_run(inst->md5Command,
 					ECORE_EXE_PIPE_READ_LINE_BUFFERED |
-					ECORE_EXE_PIPE_READ, NULL);
+					ECORE_EXE_PIPE_READ |
+					ECORE_EXE_PIPE_ERROR, NULL);
 
 	if (childHandle == NULL){
 		fprintf(stderr, "Could not create a child process!\n");
@@ -190,10 +218,11 @@ md5_check(void *data, Evas_Object *o EINA_UNUSED, void *e)
 
 	if (childPid == -1)
 		fprintf(stderr, "Could not retrieve the PID!\n");
-//	else
-//		printf("Child process PID:%u\n",(unsigned int)childPid);
+	else
+		printf("Child process PID:%u\n",(unsigned int)childPid);
 
 	ecore_event_handler_add(ECORE_EXE_EVENT_DATA, md5_msg_handler, data);
+	ecore_event_handler_add(ECORE_EXE_EVENT_ERROR, md5_msg_handler, data);
 }
 
 
@@ -288,7 +317,6 @@ find_drives(Evas_Object *hv)
 						  NULL);
 	const char *drv;
 	char text[PATH_MAX];
-	
 
 	EINA_LIST_FREE(drives, drv){
 		Eeze_Disk *disk = eeze_disk_new(drv);
@@ -314,15 +342,15 @@ EAPI_MAIN int elm_main(int argc, char **argv)
 		exit(-1);
 	}
 	eina_log_domain_level_set("eddy", EINA_LOG_LEVEL_INFO);
-   elm_policy_set(ELM_POLICY_QUIT, ELM_POLICY_QUIT_LAST_WINDOW_CLOSED);
+	elm_policy_set(ELM_POLICY_QUIT, ELM_POLICY_QUIT_LAST_WINDOW_CLOSED);
 #ifdef ENABLE_NLS
-   elm_app_compile_locale_set(LOCALEDIR);
+	elm_app_compile_locale_set(LOCALEDIR);
 #endif
-   elm_app_info_set(elm_main, "eddy", "COPYING");
+	elm_app_info_set(elm_main, "eddy", "COPYING");
 
-   setlocale(LC_ALL, "");
-   bindtextdomain(PACKAGE, LOCALE_DIR);
-   textdomain(PACKAGE);
+	setlocale(LC_ALL, "");
+	bindtextdomain(PACKAGE, LOCALE_DIR);
+	textdomain(PACKAGE);
 
 	Evas_Object *win, *table;
 	Evas_Object *iso_bt, *md5_check_bt, *usb_check_bt, *dd_bt, *help_bt;
@@ -495,6 +523,9 @@ EAPI_MAIN int elm_main(int argc, char **argv)
 
 	eina_log_domain_unregister(_eddy_log_dom);
 	_eddy_log_dom = -1;
+
+	free(inst->md5Command);
+	free(inst->md5Path);
 	free(inst);
 	return 0;
 }

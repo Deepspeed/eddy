@@ -37,6 +37,9 @@ typedef struct _Eddy_GUI
 	Evas_Object *iso;
 	Evas_Object *usb;
 	Evas_Object *md5;
+
+	char *md5Path;
+	char *md5Command;
 } Eddy_GUI;
 
 Eina_Bool debug=EINA_FALSE;
